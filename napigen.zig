@@ -117,9 +117,9 @@ pub const JsContext = struct {
 
         switch (@TypeOf(val)) {
             u8, u16, u32, c_uint => try check(napi.napi_create_uint32(self.env, val, &res)),
-            u64, usize => try check(napi.napi_create_bigint_uint64(self.env, val, &res)),
+            u64, usize, c_ulonglong => try check(napi.napi_create_bigint_uint64(self.env, val, &res)),
             i8, i16, i32, c_int => try check(napi.napi_create_int32(self.env, val, &res)),
-            i64, isize, @TypeOf(0) => try check(napi.napi_create_bigint_int64(self.env, val, &res)),
+            i64, isize, c_longlong, @TypeOf(0) => try check(napi.napi_create_bigint_int64(self.env, val, &res)),
             f16, f32, f64, @TypeOf(0.0) => try check(napi.napi_create_double(self.env, val, &res)),
             else => |T| @compileError(@typeName(T) ++ " is not supported number"),
         }
@@ -135,10 +135,10 @@ pub const JsContext = struct {
         switch (T) {
             u8, u16 => res = @as(T, @truncate(try self.read(u32, val))),
             u32, c_uint => try check(napi.napi_get_value_uint32(self.env, val, &res)),
-            u64, usize => try check(napi.napi_get_value_bigint_uint64(self.env, val, &res, &lossless)),
+            u64, usize, c_ulonglong => try check(napi.napi_get_value_bigint_uint64(self.env, val, &res, &lossless)),
             i8, i16 => res = @as(T, @truncate(self.read(i32, val))),
             i32, c_int => try check(napi.napi_get_value_int32(self.env, val, &res)),
-            i64, isize => try check(napi.napi_get_value_bigint_int64(self.env, val, &res, &lossless)),
+            i64, isize, c_longlong => try check(napi.napi_get_value_bigint_int64(self.env, val, &res, &lossless)),
             f16, f32 => res = @as(T, @floatCast(try self.readNumber(f64, val))),
             f64 => try check(napi.napi_get_value_double(self.env, val, &res)),
             else => @compileError(@typeName(T) ++ " is not supported number"),
