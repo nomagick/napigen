@@ -32,18 +32,20 @@ pub fn defineModule(comptime init_fn: fn (*JsContext, napi.napi_value) anyerror!
     @export(NapigenNapiModule.register, .{ .name = "napi_register_module_v1", .linkage = .strong });
 }
 
-pub fn defineConvertedCModule(comptime CT: type, comptime filter: ?fn ([]const u8, type) bool) void {
+pub fn defineConvertedCModule(comptime CT: type, comptime filter: ?fn ([]const u8) bool) void {
     const initFn = struct {
         fn initModule(js: *JsContext, exports: napi.napi_value) Error!napi.napi_value {
             const sizeMapObj = try js.createObject();
             const structDecoderMapObj = try js.createObject();
             const structEncoderMapObj = try js.createObject();
             const functionMapObj = try js.createObject();
+            const asyncFunctionMapObj = try js.createObject();
             const constantMapObj = try js.createObject();
             const functionSignatureMapObj = try js.createObject();
 
             @setEvalBranchQuota(100_000);
             inline for (comptime std.meta.declarations(CT)) |d| {
+                if (comptime filter != null and filter.?(d.name) == false) continue;
                 const thisField = comptime @field(CT, d.name);
                 const typeOfField = comptime @TypeOf(thisField);
                 const jsUndefined = try js.undefined();
@@ -80,8 +82,6 @@ pub fn defineConvertedCModule(comptime CT: type, comptime filter: ?fn ([]const u
                     continue;
                 }
 
-                if (comptime filter != null and filter.?(d.name, typeOfField) == false) continue;
-
                 const c_name = d.name ++ "";
                 if (@typeInfo(typeOfField) == .Fn) {
                     if (comptime !isFunctionAutomaticallyExportable(typeOfField)) continue;
@@ -101,6 +101,8 @@ pub fn defineConvertedCModule(comptime CT: type, comptime filter: ?fn ([]const u
 
                     const thisFn = try js.createNamedFunction(c_name, thisField);
                     try js.setNamedProperty(functionMapObj, c_name, thisFn);
+                    const thisAsyncFn = try js.createNamedAsyncFunction(c_name, thisField);
+                    try js.setNamedProperty(asyncFunctionMapObj, c_name, thisAsyncFn);
 
                     const thisSignatureObj = try js.createObject();
 
@@ -122,6 +124,7 @@ pub fn defineConvertedCModule(comptime CT: type, comptime filter: ?fn ([]const u
             try js.exportOne(exports, "structDecoders", structDecoderMapObj);
             try js.exportOne(exports, "structEncoders", structEncoderMapObj);
             try js.exportOne(exports, "functions", functionMapObj);
+            try js.exportOne(exports, "asyncFunctions", asyncFunctionMapObj);
             try js.exportOne(exports, "constants", constantMapObj);
             try js.exportOne(exports, "functionSignatures", functionSignatureMapObj);
 
@@ -137,16 +140,14 @@ pub const JsContext = struct {
     arena: GenerationalArena,
     refs: std.AutoHashMapUnmanaged(usize, napi.napi_ref) = .{},
     cTypeSymbolRef: napi.napi_ref,
+    threadPool: std.Thread.Pool,
 
     /// Init the JS context.
-    pub fn init(env: napi.napi_env, exports: napi.napi_value) Error!*JsContext {
+    pub fn init(env: napi.napi_env, exports: napi.napi_value) !*JsContext {
         var self = try allocator.create(JsContext);
         try check(napi.napi_set_instance_data(env, self, finalize, null));
-        self.* = .{
-            .env = env,
-            .arena = GenerationalArena.init(allocator),
-            .cTypeSymbolRef = std.mem.zeroes(napi.napi_ref),
-        };
+        self.* = .{ .env = env, .arena = GenerationalArena.init(allocator), .cTypeSymbolRef = std.mem.zeroes(napi.napi_ref), .threadPool = undefined };
+        try self.threadPool.init(.{ .allocator = allocator });
         const cTypeSymbol = try self.createSymbol("__cType");
         try check(napi.napi_create_reference(env, cTypeSymbol, 1, &self.cTypeSymbolRef));
         try self.exportOne(exports, "cTypeSymbol", cTypeSymbol);
@@ -157,6 +158,7 @@ pub const JsContext = struct {
     pub fn deinit(self: *JsContext) void {
         var _d: u32 = undefined;
         _ = napi.napi_reference_unref(self.env, self.cTypeSymbolRef, &_d);
+        self.threadPool.deinit();
         self.arena.deinit();
         allocator.destroy(self);
     }
@@ -188,6 +190,14 @@ pub const JsContext = struct {
             if (e != error.napi_pending_exception) std.debug.panic("throw failed {s} {any}", .{ msg, e });
         };
         return self.undefined() catch @panic("throw return undefined");
+    }
+    /// Throw an error.
+    pub fn toJsError(self: *JsContext, err: anyerror) napi.napi_value {
+        const msg = self.createString(@errorName(err)) catch @panic("unable to create js string for error message");
+        var jsErr: napi.napi_value = undefined;
+        check(napi.napi_create_error(self.env, null, msg, &jsErr)) catch @panic("unable to create js error");
+
+        return jsErr;
     }
 
     /// Get the JS `undefined` value.
@@ -255,7 +265,7 @@ pub const JsContext = struct {
             u8, u16, c_ushort, c_char => res = @as(T, @truncate(try self.read(u32, val))),
             u32, c_uint => try check(napi.napi_get_value_uint32(self.env, val, &res)),
             u64, usize, c_ulong, c_ulonglong => try check(napi.napi_get_value_bigint_uint64(self.env, val, &res, &lossless)),
-            i8, i16, c_short => res = @as(T, @truncate(self.read(i32, val))),
+            i8, i16, c_short => res = @as(T, @truncate(try self.read(i32, val))),
             i32, c_int => try check(napi.napi_get_value_int32(self.env, val, &res)),
             i64, isize, c_long, c_longlong => try check(napi.napi_get_value_bigint_int64(self.env, val, &res, &lossless)),
             f16, f32 => res = @as(T, @floatCast(try self.readNumber(f64, val))),
@@ -294,6 +304,13 @@ pub const JsContext = struct {
     pub fn readString(self: *JsContext, val: napi.napi_value) Error![]const u8 {
         var len: usize = try self.getStringLength(val);
         var buf = try self.arena.allocator().alloc(u8, len + 1);
+        try check(napi.napi_get_value_string_utf8(self.env, val, @as([*c]u8, @ptrCast(buf)), buf.len, &len));
+        return buf[0..len];
+    }
+
+    pub fn readStringCustomAllocator(self: *JsContext, val: napi.napi_value, customAllocator: std.mem.Allocator) Error![]const u8 {
+        var len: usize = try self.getStringLength(val);
+        var buf = try customAllocator.alloc(u8, len + 1);
         try check(napi.napi_get_value_string_utf8(self.env, val, @as([*c]u8, @ptrCast(buf)), buf.len, &len));
         return buf[0..len];
     }
@@ -360,6 +377,32 @@ pub const JsContext = struct {
         var isTypedArray: bool = undefined;
         try check(napi.napi_is_typedarray(self.env, array, &isTypedArray));
         if (isTypedArray) {
+            var res: *anyopaque = undefined;
+            var len: usize = undefined;
+            var itemTyp: usize = undefined;
+            var arrayBufferOffset: usize = undefined;
+            var arrayBuffer: napi.napi_value = undefined;
+            try check(napi.napi_get_typedarray_info(self.env, array, @ptrCast(&itemTyp), &len, @ptrCast(&res), &arrayBuffer, &arrayBufferOffset));
+            var slicePtr: []T = undefined;
+            slicePtr.len = len;
+            slicePtr.ptr = @ptrCast(@alignCast(res));
+
+            return slicePtr;
+        }
+
+        const len: u32 = try self.getArrayLength(array);
+        const res = try self.arena.allocator().alloc(T, len);
+        for (res, 0..) |*v, i| {
+            v.* = try self.read(T, try self.getElement(array, @as(u32, @intCast(i))));
+        }
+        return res;
+    }
+
+    /// Read a native slice from a JS array.
+    pub fn readArrayCustomAllocator(self: *JsContext, comptime T: type, array: napi.napi_value, customAllocator: std.mem.Allocator) Error![]T {
+        var isTypedArray: bool = undefined;
+        try check(napi.napi_is_typedarray(self.env, array, &isTypedArray));
+        if (isTypedArray) {
             var res: *[]T = undefined;
             var len: usize = undefined;
             var itemTyp: usize = undefined;
@@ -371,7 +414,7 @@ pub const JsContext = struct {
         }
 
         const len: u32 = try self.getArrayLength(array);
-        const res = try self.arena.allocator().alloc(T, len);
+        const res = try customAllocator.alloc(T, len);
         for (res, 0..) |*v, i| {
             v.* = try self.read(T, try self.getElement(array, @as(u32, @intCast(i))));
         }
@@ -396,6 +439,28 @@ pub const JsContext = struct {
         var res: [len]T = undefined;
         for (0..len) |i| {
             res[i] = try self.read(T, try self.getElement(array, @as(u32, @intCast(i))));
+        }
+        return res;
+    }
+
+    /// Read a native fixed-size array from a JS array.
+    pub fn readArrayFixedCustomAllocator(self: *JsContext, comptime T: type, comptime len: usize, array: napi.napi_value, customAllocator: std.mem.Allocator) Error![len]T {
+        var isTypedArray: bool = undefined;
+        try check(napi.napi_is_typedarray(self.env, array, &isTypedArray));
+        if (isTypedArray) {
+            var res: *[len]T = undefined;
+            var len_: usize = undefined;
+            var itemTyp: c_uint = undefined;
+            var arrayBufferOffset: usize = undefined;
+            var arrayBuffer: napi.napi_value = undefined;
+            try check(napi.napi_get_typedarray_info(self.env, array, &itemTyp, &len_, @as([*c]?*anyopaque, @ptrCast(&res)), &arrayBuffer, &arrayBufferOffset));
+
+            return res.*;
+        }
+
+        var res: [len]T = undefined;
+        for (0..len) |i| {
+            res[i] = try self.readCustomAllocator(T, try self.getElement(array, @as(u32, @intCast(i))), customAllocator);
         }
         return res;
     }
@@ -447,6 +512,27 @@ pub const JsContext = struct {
         return res;
     }
 
+    /// Read a JS array into a tuple.
+    pub fn readTupleCustomAllocator(self: *JsContext, comptime T: type, val: napi.napi_value, customAllocator: std.mem.Allocator) Error!T {
+        var res: T = undefined;
+
+        var isJsBuffer: bool = undefined;
+        try check(napi.napi_is_buffer(self.env, val, &isJsBuffer));
+        if (isJsBuffer) {
+            var buffLength: usize = undefined;
+            try check(napi.napi_get_buffer_info(self.env, val, @as([*c]?*anyopaque, @ptrCast(@alignCast(&res))), &buffLength));
+
+            return res;
+        }
+
+        const fields = std.meta.fields(T);
+        inline for (fields, 0..) |f, i| {
+            const v = try self.getElement(val, @as(u32, @truncate(i)));
+            @field(res, f.name) = try self.readCustomAllocator(f.type, v, customAllocator);
+        }
+        return res;
+    }
+
     /// Create an empty JS object.
     pub fn createObject(self: *JsContext) Error!napi.napi_value {
         var res: napi.napi_value = undefined;
@@ -483,6 +569,26 @@ pub const JsContext = struct {
         inline for (std.meta.fields(T)) |f| {
             const v = try self.getNamedProperty(val, f.name ++ "");
             @field(res, f.name) = try self.read(f.type, v);
+        }
+        return res;
+    }
+
+    /// Read a struct/tuple from a JS object.
+    pub fn readObjectCustomAllocator(self: *JsContext, comptime T: type, val: napi.napi_value, customAllocator: std.mem.Allocator) Error!T {
+        var res: T = undefined;
+
+        var isJsBuffer: bool = undefined;
+        try check(napi.napi_is_buffer(self.env, val, &isJsBuffer));
+        if (isJsBuffer) {
+            var buffLength: usize = undefined;
+            try check(napi.napi_get_buffer_info(self.env, val, @as([*c]?*anyopaque, @ptrCast(@alignCast(&res))), &buffLength));
+
+            return res;
+        }
+
+        inline for (std.meta.fields(T)) |f| {
+            const v = try self.getNamedProperty(val, f.name ++ "");
+            @field(res, f.name) = try self.readCustomAllocator(f.type, v, customAllocator);
         }
         return res;
     }
@@ -566,6 +672,37 @@ pub const JsContext = struct {
         return res;
     }
 
+    pub fn isWrapped(self: *JsContext, val: napi.napi_value) bool {
+        var res: *anyopaque = undefined;
+        const r = napi.napi_unwrap(self.env, val, @as([*c]?*anyopaque, @ptrCast(&res)));
+        if (r == napi.napi_ok) {
+            return true;
+        }
+        return false;
+    }
+
+    pub fn briefNapiValue(self: *JsContext, val: napi.napi_value) !void {
+        const jsType = try self.typeOf(val);
+
+        switch (jsType) {
+            napi.napi_undefined => std.debug.print("undefined\n", .{}),
+            napi.napi_null => std.debug.print("null\n", .{}),
+            napi.napi_boolean => std.debug.print("boolean {any}\n", .{self.readBoolean(val)}),
+            napi.napi_string => std.debug.print("string {any}\n", .{self.readString(val)}),
+            napi.napi_symbol => std.debug.print("symbol {any}\n", .{val}),
+            napi.napi_object => {
+                var jsPropNames: napi.napi_value = undefined;
+                try check(napi.napi_get_property_names(self.env, val, &jsPropNames));
+                const propNames = try self.readArray([]const u8, jsPropNames);
+                std.debug.print("object {any}\n", .{propNames});
+            },
+            napi.napi_function => std.debug.print("function {any}\n", .{val}),
+            napi.napi_external => std.debug.print("external {any}\n", .{val}),
+            napi.napi_bigint => std.debug.print("bigint {any}\n", .{val}),
+            else => std.debug.print("others {any}\n", .{val}),
+        }
+    }
+
     pub const read = if (@hasDecl(root, "napigenRead")) root.napigenRead else defaultRead;
 
     pub fn defaultRead(self: *JsContext, comptime T: type, val: napi.napi_value) Error!T {
@@ -588,6 +725,37 @@ pub const JsContext = struct {
             .Array => |info| try self.readArrayFixed(info.child, info.len, val),
             else => @compileError("reading " ++ @tagName(@typeInfo(T)) ++ " " ++ @typeName(T) ++ " is not supported"),
         };
+    }
+
+    pub const readCustomAllocator = if (@hasDecl(root, "napigenReadCustomAllocator")) root.napigenReadCustomAllocator else defaultReadCustomAllocator;
+
+    pub fn defaultReadCustomAllocator(self: *JsContext, comptime T: type, val: napi.napi_value, customAllocator: std.mem.Allocator) Error!T {
+        if (T == napi.napi_value) return val;
+        if (comptime isString(T)) return self.readString(val);
+
+        return switch (@typeInfo(T)) {
+            .Void => void{},
+            .Null => null,
+            .Bool => self.readBoolean(val),
+            .Int, .ComptimeInt, .Float, .ComptimeFloat => self.readNumber(T, val),
+            .Enum => std.meta.intToEnum(T, self.readCustomAllocator(u32, val, customAllocator)),
+            .Struct, .Union => if (isTuple(T)) self.readTupleCustomAllocator(T, val, customAllocator) else self.readObjectCustomAllocator(T, val, customAllocator),
+            .Optional => |info| if (try self.typeOf(val) == napi.napi_null) null else self.readCustomAllocator(info.child, val, customAllocator),
+            .Pointer => |info| switch (info.size) {
+                .One, .C => self.unwrap(info.child, val),
+                .Slice => self.readArrayCustomAllocator(info.child, val, customAllocator),
+                else => @compileError("reading " ++ @tagName(@typeInfo(T)) ++ " " ++ @typeName(T) ++ " is not supported"),
+            },
+            .Array => |info| try self.readArrayFixedCustomAllocator(info.child, info.len, val, customAllocator),
+            else => @compileError("reading " ++ @tagName(@typeInfo(T)) ++ " " ++ @typeName(T) ++ " is not supported"),
+        };
+    }
+
+    pub fn getGlobal(self: *JsContext) !napi.napi_value {
+        var globalObj: napi.napi_value = undefined;
+        try check(napi.napi_get_global(self.env, &globalObj));
+
+        return globalObj;
     }
 
     pub const write = if (@hasDecl(root, "napigenWrite")) root.napigenWrite else defaultWrite;
@@ -621,8 +789,12 @@ pub const JsContext = struct {
         return self.createNamedFunction("anonymous", fun);
     }
 
-    /// Create a named JS function.
     pub fn createNamedFunction(self: *JsContext, comptime name: [*:0]const u8, comptime fun: anytype) Error!napi.napi_value {
+        return self.createNamedFunctionWithThisArg(name, fun, null);
+    }
+
+    /// Create a named JS function.
+    pub fn createNamedFunctionWithThisArg(self: *JsContext, comptime name: [*:0]const u8, comptime fun: anytype, thisPtr: ?*anyopaque) Error!napi.napi_value {
         const F = @TypeOf(fun);
         const Args = std.meta.ArgsTuple(F);
         const Res = @typeInfo(F).Fn.return_type.?;
@@ -647,7 +819,18 @@ pub const JsContext = struct {
                 var args: Args = undefined;
                 var argc: usize = args.len;
                 var argv: [args.len]napi.napi_value = undefined;
-                try check(napi.napi_get_cb_info(js.env, cb_info, &argc, &argv, null, null));
+
+                var jsThis: napi.napi_value = undefined;
+                var cThis: ?*anyopaque = undefined;
+                try check(napi.napi_get_cb_info(js.env, cb_info, &argc, &argv, &jsThis, &cThis));
+                const jsGlobal = try js.getGlobal();
+
+                if (try js.equals(jsGlobal, jsThis)) {
+                    jsThis = null;
+                }
+                if (!js.isWrapped(jsThis)) {
+                    jsThis = null;
+                }
 
                 var i: usize = 0;
                 inline for (std.meta.fields(Args)) |f| {
@@ -655,9 +838,30 @@ pub const JsContext = struct {
                         @field(args, f.name) = js;
                         continue;
                     }
-
-                    @field(args, f.name) = try js.read(f.type, argv[i]);
-                    i += 1;
+                    if (i == 0) {
+                        switch (@typeInfo(f.type)) {
+                            .Pointer => |info| switch (info.size) {
+                                .One, .C => {
+                                    if (cThis != null) {
+                                        @field(args, f.name) = @ptrCast(@alignCast(cThis));
+                                    } else if (jsThis != null) {
+                                        @field(args, f.name) = try js.read(f.type, jsThis);
+                                    } else {
+                                        @field(args, f.name) = try js.read(f.type, argv[i]);
+                                        i += 1;
+                                    }
+                                },
+                                else => {
+                                    @field(args, f.name) = try js.read(f.type, argv[i]);
+                                    i += 1;
+                                },
+                            },
+                            else => {
+                                @field(args, f.name) = try js.read(f.type, argv[i]);
+                                i += 1;
+                            },
+                        }
+                    }
                 }
 
                 if (i != argc) {
@@ -670,7 +874,154 @@ pub const JsContext = struct {
         };
 
         var res: napi.napi_value = undefined;
-        try check(napi.napi_create_function(self.env, name, napi.NAPI_AUTO_LENGTH, &Helper.call, null, &res));
+        try check(napi.napi_create_function(self.env, name, napi.NAPI_AUTO_LENGTH, &Helper.call, thisPtr, &res));
+        return res;
+    }
+
+    pub fn createAsyncFunction(self: *JsContext, comptime fun: anytype) Error!napi.napi_value {
+        return self.createNamedAsyncFunction("anonymous", fun);
+    }
+
+    pub fn createNamedAsyncFunction(self: *JsContext, comptime name: [*:0]const u8, comptime fun: anytype) Error!napi.napi_value {
+        return self.createNamedAsyncFunctionWithThisArg(name, fun, null);
+    }
+
+    pub fn createNamedAsyncFunctionWithThisArg(self: *JsContext, comptime name: [*:0]const u8, comptime fun: anytype, thisPtr: ?*anyopaque) Error!napi.napi_value {
+        const F = @TypeOf(fun);
+        const Args = std.meta.ArgsTuple(F);
+        const Res = @typeInfo(F).Fn.return_type.?;
+
+        const Helper1 = struct {
+            fnArgs: Args,
+            fnRet: Res,
+            arena: std.heap.ArenaAllocator,
+            jsDeferred: napi.napi_deferred,
+            jsTSFN: napi.napi_threadsafe_function,
+
+            fn callJsCb(env: napi.napi_env, jsCallback: napi.napi_value, context: ?*anyopaque, data: ?*anyopaque) callconv(.C) void {
+                _ = jsCallback;
+                _ = data;
+
+                var js = JsContext.getInstance(env);
+                const this: *@This() = @ptrCast(@alignCast((context)));
+                defer allocator.destroy(this);
+                defer this.arena.deinit();
+                defer _ = napi.napi_release_threadsafe_function(this.jsTSFN, napi.napi_tsfn_release);
+                const res = this.fnRet;
+
+                if (comptime @typeInfo(Res) == .ErrorUnion) {
+                    if (res) |r| {
+                        check(napi.napi_resolve_deferred(env, this.jsDeferred, js.write(r))) catch |e| {
+                            _ = napi.napi_reject_deferred(env, this.jsDeferred, js.toJsError(e));
+                            return;
+                        };
+                    }
+                    _ = napi.napi_reject_deferred(env, this.jsDeferred, js.toJsError(res));
+                    return;
+                }
+
+                const jsRes = js.write(res) catch |e| {
+                    _ = napi.napi_reject_deferred(env, this.jsDeferred, js.toJsError(e));
+                    return;
+                };
+
+                check(napi.napi_resolve_deferred(env, this.jsDeferred, jsRes)) catch |e| {
+                    _ = napi.napi_reject_deferred(env, this.jsDeferred, js.toJsError(e));
+                    return;
+                };
+            }
+
+            fn call(this: *@This()) void {
+                const res = @call(.auto, fun, this.fnArgs);
+                this.fnRet = res;
+                _ = napi.napi_call_threadsafe_function(this.jsTSFN, @ptrCast(&this.fnRet), napi.napi_tsfn_blocking);
+                defer _ = napi.napi_release_threadsafe_function(this.jsTSFN, napi.napi_tsfn_release);
+            }
+        };
+
+        const Helper2 = struct {
+            fn call(env: napi.napi_env, cb_info: napi.napi_callback_info) callconv(.C) napi.napi_value {
+                var js = JsContext.getInstance(env);
+
+                var promise: napi.napi_value = undefined;
+                var deferred: napi.napi_deferred = undefined;
+                check(napi.napi_create_promise(env, &deferred, &promise)) catch |e| return js.throw(e);
+                var helper = allocator.create(Helper1) catch |e| return js.throw(e);
+                helper.jsDeferred = deferred;
+                helper.arena = std.heap.ArenaAllocator.init(allocator);
+
+                const asyncResourceName = js.createString("native_call_" ++ @typeName(F)) catch |e| return js.throw(e);
+                check(napi.napi_create_threadsafe_function(env, null, null, asyncResourceName, 0, 2, null, null, @ptrCast(helper), &Helper1.callJsCb, &helper.jsTSFN)) catch |e| return js.throw(e);
+                helper.fnArgs = readArgs(js, cb_info, helper.arena.allocator()) catch |e| return js.throw(e);
+
+                js.threadPool.spawn(Helper1.call, .{helper}) catch |e| return js.throw(e);
+
+                return promise;
+            }
+
+            fn readArgs(js: *JsContext, cb_info: napi.napi_callback_info, customAllocator: std.mem.Allocator) Error!Args {
+                var args: Args = undefined;
+                var argc: usize = args.len;
+                var argv: [args.len]napi.napi_value = undefined;
+
+                var jsThis: napi.napi_value = undefined;
+                var cThis: ?*anyopaque = undefined;
+                try check(napi.napi_get_cb_info(js.env, cb_info, &argc, &argv, &jsThis, &cThis));
+                const jsGlobal = try js.getGlobal();
+
+                if (try js.equals(jsGlobal, jsThis)) {
+                    jsThis = null;
+                }
+                if (!js.isWrapped(jsThis)) {
+                    jsThis = null;
+                }
+
+                var i: usize = 0;
+                inline for (std.meta.fields(Args)) |f| {
+                    if (comptime f.type == *JsContext) {
+                        @field(args, f.name) = js;
+                        continue;
+                    }
+                    if (i == 0) {
+                        switch (@typeInfo(f.type)) {
+                            .Pointer => |info| switch (info.size) {
+                                .One, .C => {
+                                    if (cThis != null) {
+                                        @field(args, f.name) = @ptrCast(@alignCast(cThis));
+                                    } else if (jsThis != null) {
+                                        @field(args, f.name) = try js.readCustomAllocator(f.type, jsThis, customAllocator);
+                                    } else {
+                                        @field(args, f.name) = try js.readCustomAllocator(f.type, argv[i], customAllocator);
+                                        i += 1;
+                                    }
+                                },
+                                else => {
+                                    @field(args, f.name) = try js.readCustomAllocator(f.type, argv[i], customAllocator);
+                                    i += 1;
+                                },
+                            },
+                            else => {
+                                @field(args, f.name) = try js.readCustomAllocator(f.type, argv[i], customAllocator);
+                                i += 1;
+                            },
+                        }
+                    } else {
+                        @field(args, f.name) = try js.readCustomAllocator(f.type, argv[i], customAllocator);
+                        i += 1;
+                    }
+                }
+
+                if (i != argc) {
+                    std.debug.print("Expected {d} args\n", .{i});
+                    return error.InvalidArgumentCount;
+                }
+
+                return args;
+            }
+        };
+
+        var res: napi.napi_value = undefined;
+        try check(napi.napi_create_function(self.env, name, napi.NAPI_AUTO_LENGTH, &Helper2.call, thisPtr, &res));
         return res;
     }
 
