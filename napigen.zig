@@ -32,6 +32,22 @@ pub fn defineModule(comptime init_fn: fn (*JsContext, napi.napi_value) anyerror!
     @export(NapigenNapiModule.register, .{ .name = "napi_register_module_v1", .linkage = .strong });
 }
 
+fn KnownArgsTuple(comptime Function: type) type {
+    const info = @typeInfo(Function);
+    if (info != .Fn)
+        @compileError("ArgsTuple expects a function type");
+
+    const function_info = info.Fn;
+
+    comptime var argument_field_list: [function_info.params.len]type = undefined;
+    inline for (function_info.params, 0..) |arg, i| {
+        const T = arg.type orelse @compileError("cannot create ArgsTuple for function with an 'anytype' parameter");
+        argument_field_list[i] = T;
+    }
+
+    return std.meta.Tuple(&argument_field_list);
+}
+
 pub fn defineConvertedCModule(comptime CT: type, comptime filter: ?fn ([]const u8) bool) void {
     const initFn = struct {
         fn initModule(js: *JsContext, exports: napi.napi_value) Error!napi.napi_value {
@@ -42,6 +58,7 @@ pub fn defineConvertedCModule(comptime CT: type, comptime filter: ?fn ([]const u
             const asyncFunctionMapObj = try js.createObject();
             const constantMapObj = try js.createObject();
             const functionSignatureMapObj = try js.createObject();
+            const wrapBuffFunction = try js.createNamedFunction("wrapBuff", JsContext.wrapBuff);
 
             @setEvalBranchQuota(100_000);
             inline for (comptime std.meta.declarations(CT)) |d| {
@@ -85,8 +102,9 @@ pub fn defineConvertedCModule(comptime CT: type, comptime filter: ?fn ([]const u
                 const c_name = d.name ++ "";
                 if (@typeInfo(typeOfField) == .Fn) {
                     if (comptime !isFunctionAutomaticallyExportable(typeOfField)) continue;
-                    const fnArgs = std.meta.ArgsTuple(typeOfField);
-                    const fnRes = @typeInfo(typeOfField).Fn.return_type.?;
+                    const fnArgs = KnownArgsTuple(typeOfField);
+                    const fnTyp = @typeInfo(typeOfField).Fn;
+                    const fnRes = fnTyp.return_type.?;
                     const args: fnArgs = undefined;
 
                     const fnArgsArray = try js.createArray();
@@ -97,6 +115,9 @@ pub fn defineConvertedCModule(comptime CT: type, comptime filter: ?fn ([]const u
                         }
                         const fld = @field(args, f.name);
                         try js.setElement(fnArgsArray, i, try js.createString(cTypeName(@TypeOf(fld))));
+                    }
+                    if (fnTyp.is_var_args) {
+                        try js.setElement(fnArgsArray, fnTyp.params.len, try js.createString("..."));
                     }
 
                     const thisFn = try js.createNamedFunction(c_name, thisField);
@@ -127,6 +148,8 @@ pub fn defineConvertedCModule(comptime CT: type, comptime filter: ?fn ([]const u
             try js.exportOne(exports, "asyncFunctions", asyncFunctionMapObj);
             try js.exportOne(exports, "constants", constantMapObj);
             try js.exportOne(exports, "functionSignatures", functionSignatureMapObj);
+
+            try js.exportOne(exports, "wrapBuff", wrapBuffFunction);
 
             return exports;
         }
@@ -491,12 +514,17 @@ pub const JsContext = struct {
         return res;
     }
 
+    pub fn isBuffer(self: *JsContext, val: napi.napi_value) !bool {
+        var isJsBuffer: bool = undefined;
+        try check(napi.napi_is_buffer(self.env, val, &isJsBuffer));
+        return isJsBuffer;
+    }
+
     /// Read a JS array into a tuple.
     pub fn readTuple(self: *JsContext, comptime T: type, val: napi.napi_value) Error!T {
         var res: T = undefined;
 
-        var isJsBuffer: bool = undefined;
-        try check(napi.napi_is_buffer(self.env, val, &isJsBuffer));
+        const isJsBuffer: bool = try self.isBuffer(val);
         if (isJsBuffer) {
             var buffLength: usize = undefined;
             try check(napi.napi_get_buffer_info(self.env, val, @as([*c]?*anyopaque, @ptrCast(@alignCast(&res))), &buffLength));
@@ -516,8 +544,7 @@ pub const JsContext = struct {
     pub fn readTupleCustomAllocator(self: *JsContext, comptime T: type, val: napi.napi_value, customAllocator: std.mem.Allocator) Error!T {
         var res: T = undefined;
 
-        var isJsBuffer: bool = undefined;
-        try check(napi.napi_is_buffer(self.env, val, &isJsBuffer));
+        const isJsBuffer: bool = try self.isBuffer(val);
         if (isJsBuffer) {
             var buffLength: usize = undefined;
             try check(napi.napi_get_buffer_info(self.env, val, @as([*c]?*anyopaque, @ptrCast(@alignCast(&res))), &buffLength));
@@ -557,8 +584,7 @@ pub const JsContext = struct {
     pub fn readObject(self: *JsContext, comptime T: type, val: napi.napi_value) Error!T {
         var res: T = undefined;
 
-        var isJsBuffer: bool = undefined;
-        try check(napi.napi_is_buffer(self.env, val, &isJsBuffer));
+        const isJsBuffer: bool = try self.isBuffer(val);
         if (isJsBuffer) {
             var buffLength: usize = undefined;
             try check(napi.napi_get_buffer_info(self.env, val, @as([*c]?*anyopaque, @ptrCast(@alignCast(&res))), &buffLength));
@@ -577,8 +603,7 @@ pub const JsContext = struct {
     pub fn readObjectCustomAllocator(self: *JsContext, comptime T: type, val: napi.napi_value, customAllocator: std.mem.Allocator) Error!T {
         var res: T = undefined;
 
-        var isJsBuffer: bool = undefined;
-        try check(napi.napi_is_buffer(self.env, val, &isJsBuffer));
+        const isJsBuffer: bool = try self.isBuffer(val);
         if (isJsBuffer) {
             var buffLength: usize = undefined;
             try check(napi.napi_get_buffer_info(self.env, val, @as([*c]?*anyopaque, @ptrCast(@alignCast(&res))), &buffLength));
@@ -653,11 +678,14 @@ pub const JsContext = struct {
         }
     }
 
+    fn simpleDeleteRef(env: napi.napi_env, _: ?*anyopaque, ref: ?*anyopaque) callconv(.C) void {
+        _ = napi.napi_delete_reference(env, @ptrCast(@alignCast(ref)));
+    }
+
     /// Unwrap a pointer from a JS object.
     pub fn unwrap(self: *JsContext, comptime T: type, val: napi.napi_value) Error!*T {
         var res: *T = undefined;
-        var isJsBuffer: bool = undefined;
-        try check(napi.napi_is_buffer(self.env, val, &isJsBuffer));
+        const isJsBuffer: bool = try self.isBuffer(val);
         if (isJsBuffer) {
             var buffLength: usize = undefined;
             try check(napi.napi_get_buffer_info(self.env, val, @as([*c]?*anyopaque, @ptrCast(&res)), &buffLength));
@@ -751,6 +779,116 @@ pub const JsContext = struct {
         };
     }
 
+    pub fn dynamicRead(self: *JsContext, napiSlice: []napi.napi_value, result: *[]?[*c]anyopaque) !void {
+        var ptr: ?*u8 = @ptrCast(@alignCast(result.*));
+        for (napiSlice) |nv| {
+            const napiType = try self.typeOf(nv);
+            switch (napiType) {
+                napi.napi_null, napi.napi_undefined => {
+                    const ptrPtr: [*c]anyopaque = @ptrCast(@alignCast(ptr));
+                    ptrPtr.* = null;
+                    ptr += @sizeOf([*c]anyopaque);
+                },
+                napi.napi_boolean => {
+                    const boolVal = try self.readBoolean(nv);
+                    const tgt: [*c]bool = @ptrCast(@alignCast(ptr));
+                    tgt.* = boolVal;
+                    ptr += @sizeOf(boolVal);
+                },
+                napi.napi_number => {
+                    const u32Val = try self.readNumber(u32, nv);
+                    const tgt: [*c]u32 = @ptrCast(@alignCast(ptr));
+                    tgt.* = u32Val;
+                    ptr += @sizeOf(u32);
+                },
+                napi.napi_object => {
+                    const unwrapped = try self.unwrap([*c]anyopaque, nv);
+                    const tgt: [*c]anyopaque = @ptrCast(@alignCast(ptr));
+                    tgt.* = unwrapped;
+                    ptr += @sizeOf([*c]anyopaque);
+                },
+                napi.napi_string => {
+                    const u8Slice = try self.readString(nv);
+                    const tgt: [*c]const []u8 = @ptrCast(@alignCast(ptr));
+                    tgt.* = u8Slice.ptr;
+                    ptr += @sizeOf([*c]const []u8);
+                },
+                napi.napi_function => {
+                    const unwrapped = try self.unwrap([*c]anyopaque, nv);
+                    if (unwrapped == null) {
+                        try self.throw(error.InvalidCallback);
+                        return;
+                    }
+                    const tgt: [*c]anyopaque = @ptrCast(@alignCast(ptr));
+                    tgt.* = unwrapped;
+                    ptr += @sizeOf([*c]anyopaque);
+                },
+                napi.napi_bigint => {
+                    const u64Val = try self.readNumber(u64, nv);
+                    const tgt: [*c]u64 = @ptrCast(@alignCast(ptr));
+                    tgt.* = u64Val;
+                    ptr += @sizeOf(u64);
+                },
+                else => {},
+            }
+        }
+    }
+
+    pub fn dynamicReadCustomAllocator(self: *JsContext, napiSlice: []napi.napi_value, result: *[]?[*c]anyopaque, customAllocator: std.mem.Allocator) !void {
+        var ptr: ?*u8 = @ptrCast(@alignCast(result.*));
+        for (napiSlice) |nv| {
+            const napiType = try self.typeOf(nv);
+            switch (napiType) {
+                napi.napi_null, napi.napi_undefined => {
+                    const ptrPtr: [*c]anyopaque = @ptrCast(@alignCast(ptr));
+                    ptrPtr.* = null;
+                    ptr += @sizeOf([*c]anyopaque);
+                },
+                napi.napi_boolean => {
+                    const boolVal = try self.readBoolean(nv);
+                    const tgt: [*c]bool = @ptrCast(@alignCast(ptr));
+                    tgt.* = boolVal;
+                    ptr += @sizeOf(boolVal);
+                },
+                napi.napi_number => {
+                    const u32Val = try self.readNumber(u32, nv);
+                    const tgt: [*c]u32 = @ptrCast(@alignCast(ptr));
+                    tgt.* = u32Val;
+                    ptr += @sizeOf(u32);
+                },
+                napi.napi_object => {
+                    const unwrapped = try self.unwrap([*c]anyopaque, nv);
+                    const tgt: [*c]anyopaque = @ptrCast(@alignCast(ptr));
+                    tgt.* = unwrapped;
+                    ptr += @sizeOf([*c]anyopaque);
+                },
+                napi.napi_string => {
+                    const u8Slice = try self.readStringCustomAllocator(nv, customAllocator);
+                    const tgt: [*c]const []u8 = @ptrCast(@alignCast(ptr));
+                    tgt.* = u8Slice.ptr;
+                    ptr += @sizeOf([*c]const []u8);
+                },
+                napi.napi_function => {
+                    const unwrapped = try self.unwrap([*c]anyopaque, nv);
+                    if (unwrapped == null) {
+                        try self.throw(error.InvalidCallback);
+                        return;
+                    }
+                    const tgt: [*c]anyopaque = @ptrCast(@alignCast(ptr));
+                    tgt.* = unwrapped;
+                    ptr += @sizeOf([*c]anyopaque);
+                },
+                napi.napi_bigint => {
+                    const u64Val = try self.readNumber(u64, nv);
+                    const tgt: [*c]u64 = @ptrCast(@alignCast(ptr));
+                    tgt.* = u64Val;
+                    ptr += @sizeOf(u64);
+                },
+                else => {},
+            }
+        }
+    }
+
     pub fn getGlobal(self: *JsContext) !napi.napi_value {
         var globalObj: napi.napi_value = undefined;
         try check(napi.napi_get_global(self.env, &globalObj));
@@ -796,8 +934,9 @@ pub const JsContext = struct {
     /// Create a named JS function.
     pub fn createNamedFunctionWithThisArg(self: *JsContext, comptime name: [*:0]const u8, comptime fun: anytype, thisPtr: ?*anyopaque) Error!napi.napi_value {
         const F = @TypeOf(fun);
-        const Args = std.meta.ArgsTuple(F);
+        const Args = KnownArgsTuple(F);
         const Res = @typeInfo(F).Fn.return_type.?;
+        const FnInfo = @typeInfo(F).Fn;
 
         const Helper = struct {
             fn call(env: napi.napi_env, cb_info: napi.napi_callback_info) callconv(.C) napi.napi_value {
@@ -864,6 +1003,14 @@ pub const JsContext = struct {
                     }
                 }
 
+                if (FnInfo.is_var_args) {
+                    const resetNapiVals: [argc - i]napi.napi_value = argv + i;
+                    var resetArgs: [16]?[*c]anyopaque = undefined;
+                    try self.dynamicRead(resetNapiVals, &resetArgs);
+
+                    return args ++ resetArgs;
+                }
+
                 if (i != argc) {
                     std.debug.print("Expected {d} args\n", .{i});
                     return error.InvalidArgumentCount;
@@ -888,8 +1035,9 @@ pub const JsContext = struct {
 
     pub fn createNamedAsyncFunctionWithThisArg(self: *JsContext, comptime name: [*:0]const u8, comptime fun: anytype, thisPtr: ?*anyopaque) Error!napi.napi_value {
         const F = @TypeOf(fun);
-        const Args = std.meta.ArgsTuple(F);
+        const Args = KnownArgsTuple(F);
         const Res = @typeInfo(F).Fn.return_type.?;
+        const FnInfo = @typeInfo(F).Fn;
 
         const Helper1 = struct {
             fnArgs: Args,
@@ -1011,6 +1159,14 @@ pub const JsContext = struct {
                     }
                 }
 
+                if (FnInfo.is_var_args) {
+                    const resetNapiVals: [argc - i]napi.napi_value = argv + i;
+                    var resetArgs: [16]?[*c]anyopaque = undefined;
+                    try self.dynamicReadCustomAllocator(resetNapiVals, &resetArgs, customAllocator);
+
+                    return args ++ resetArgs;
+                }
+
                 if (i != argc) {
                     std.debug.print("Expected {d} args\n", .{i});
                     return error.InvalidArgumentCount;
@@ -1074,14 +1230,14 @@ pub const JsContext = struct {
         return try self.createNamedFunction(cTypeName(typ) ++ "_decoder", tmp);
     }
 
-    pub fn createStructEncoderFunction(self: *JsContext, comptime typ: type) Error!napi.napi_value {
+    pub fn createStructEncoderFunction(self: *JsContext, comptime typ: type) !napi.napi_value {
         switch (@typeInfo(typ)) {
             .Struct, .Union => {},
             else => @compileError("Struct encoder can only be created for Struct or Union"),
         }
 
         const tmp = struct {
-            fn constructor(ijs: *JsContext, input: typ) Error!napi.napi_value {
+            fn constructor(ijs: *JsContext, input: typ) !napi.napi_value {
                 const jsBuffer = try ijs.createBuffer(@sizeOf(@TypeOf(input)));
                 var buff: *typ = undefined;
                 var buffSize: usize = undefined;
@@ -1092,6 +1248,27 @@ pub const JsContext = struct {
         }.constructor;
 
         return try self.createNamedFunction(cTypeName(typ) ++ "_encoder", tmp);
+    }
+
+    pub fn wrapBuff(self: *JsContext, target: napi.napi_value, jsBuff: napi.napi_value) !napi.napi_value {
+        const targetType = try self.typeOf(target);
+
+        if (targetType != napi.napi_object and targetType != napi.napi_function) {
+            return self.throw(error.napi_object_expected);
+        }
+        const jsBuffValid = try self.isBuffer(jsBuff);
+        if (!jsBuffValid) {
+            return self.throw(error.napi_buffer_expected);
+        }
+        var res: *anyopaque = undefined;
+        var buffLength: usize = undefined;
+        var ref: napi.napi_ref = undefined;
+
+        try check(napi.napi_get_buffer_info(self.env, jsBuff, @ptrCast(@alignCast(&res)), &buffLength));
+        try check(napi.napi_create_reference(self.env, target, 1, &ref));
+        try check(napi.napi_wrap(self.env, target, res, &simpleDeleteRef, ref, null));
+
+        return target;
     }
 };
 
