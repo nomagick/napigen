@@ -1181,6 +1181,80 @@ pub const JsContext = struct {
         return res;
     }
 
+    pub fn createCallbackFunctionFactory(self: *JsContext, comptime fnSig: type) !napi.napi_value {
+        const fnType = comptime detectCallbackFunctionType(fnSig);
+
+        if (fnType == .Incompatible) {
+            return self.undefined();
+        }
+
+        const Args = std.meta.ArgsTuple(fnSig);
+        const Res = @typeInfo(fnSig).Fn.return_type.?;
+        const FnInfo = @typeInfo(fnSig).Fn;
+
+        const Helper1 = struct {
+            jsEnv: napi.napi_env,
+            jsFunc: napi.napi_value,
+
+            fn call(...) callconv(.C) Res {
+                var args: Args = undefined;
+                var argv: [args.len]napi.napi_value = undefined;
+                const vaList = @cVaStart();
+                inline for (std.meta.fields(Args)) |f| {
+                    @field(args, f.name) = @cVaArg(vaList, f.type);
+                }
+                @cVaEnd(&vaList);
+                var this: *@This() = undefined;
+                if (fnType == .FirstPramPtr) {
+                    this = @ptrCast(args[0]);
+                } else {
+                    this = @ptrCast(args[args.len - 1]);
+                }
+
+                const env = this.jsEnv;
+                var js = JsContext.getInstance(env);
+
+                inline for (std.meta.fields(Args), 0..) |f, i| {
+                    argv[i] = try self.write(@field(args, f.name));
+                }
+                const globalThis = js.getGlobal() orelse @panic("Failed to call js function");
+                var res: napi.napi_value = undefined;
+                check(napi.napi_call_function(env, globalThis, this.jsFunc, argv.len, &argv, &res)) orelse @panic("Failed to call js function");
+                js.read(FnInfo.return_type, res) orelse @panic("Failed to read from js return value");
+
+                return res;
+            }
+        };
+
+        const Helper2 = struct {
+            fn createCallback(env: napi.napi_env, jsFunc: napi.napi_value) !napi.napi_value {
+                var js = JsContext.getInstance(env);
+                const typ = try js.typeOf(jsFunc);
+                if (typ != napi.napi_function) {
+                    return NapiError.napi_function_expected;
+                }
+                var helper = try allocator.create(Helper1);
+                helper.jsEnv = env;
+                helper.jsFunc = jsFunc;
+                try check(napi.napi_wrap(env, jsFunc, &Helper1.call, &freeHelper, helper, null));
+
+                const jsBuff = try js.createBuffer(@sizeOf(helper));
+                var buff: *Helper1 = undefined;
+                var buffSize: usize = undefined;
+                try check(napi.napi_get_buffer_info(env, jsBuff, @as([*c]?*anyopaque, @ptrCast(&buff)), &buffSize));
+                buff.* = helper;
+
+                return jsBuff;
+            }
+
+            fn freeHelper(_: napi.napi_env, _: *anyopaque, ptr: *anyopaque) callconv(.C) void {
+                allocator.destroy(ptr);
+            }
+        };
+
+        return self.createFunction(Helper2.createCallback);
+    }
+
     /// Call a JS function.
     pub fn callFunction(self: *JsContext, recv: napi.napi_value, fun: napi.napi_value, args: anytype) Error!napi.napi_value {
         const Args = @TypeOf(args);
@@ -1451,4 +1525,36 @@ fn isFunctionAutomaticallyExportable(comptime Function: type) bool {
     }
 
     return true;
+}
+
+const CallbackFunctionType = enum {
+    FirstPramPtr,
+    LastParamPtr,
+    Incompatible,
+};
+
+fn detectCallbackFunctionType(comptime fnSig: type) CallbackFunctionType {
+    const F = @typeInfo(fnSig);
+    if (F != .Fn) {
+        return CallbackFunctionType.Invalid;
+    }
+    if (F.Fn.is_var_args) {
+        return CallbackFunctionType.Invalid;
+    }
+    const Args = std.meta.ArgsTuple(fnSig);
+    const fields = std.meta.fields(Args);
+    if (fields.len < 1) {
+        return CallbackFunctionType.Invalid;
+    }
+
+    const lastField = fields[fields.len - 1];
+    if (lastField.type == ?*anyopaque or lastField.type == *anyopaque) {
+        return CallbackFunctionType.LastParamPtr;
+    }
+    const firstField = fields[0];
+    if (firstField.type == ?*anyopaque or firstField.type == *anyopaque) {
+        return CallbackFunctionType.FirstPramPtr;
+    }
+
+    return CallbackFunctionType.Invalid;
 }
